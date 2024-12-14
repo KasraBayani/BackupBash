@@ -1,0 +1,891 @@
+#!/bin/bash
+
+# -----------------------------
+# BackupBash - Comprehensive Backup Script
+# -----------------------------
+# Author: Kasra
+# Description: A versatile backup script supporting both graphical (Zenity) and command-line interfaces.
+# Features:
+#   - Backup and Restore Modes
+#   - Compression (none, gzip, bzip2, zip, tar)
+#   - Encryption (AES-256-CBC, ChaCha20)
+#   - Incremental Backups
+#   - Logging
+#   - Scheduling via cron
+#   - Configuration File Support
+#   - Self-installation to PATH
+#   - Automatically opens backup destination after successful backup
+#   - Thank-you dialog with GitHub link
+# License: MIT
+# -----------------------------
+
+# Enable strict error handling
+set -euo pipefail
+IFS=$'\n\t'
+
+# -----------------------------
+# Variables and Configuration
+# -----------------------------
+
+# Configuration file path
+CONFIG_FILE="$HOME/.backup_config"
+
+# Load configuration if it exists
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Define log file (to be set after destination directory is known)
+LOG_FILE=""
+
+# GitHub URL
+GITHUB_URL="https://github.com/MrDarkna"
+
+# -----------------------------
+# Functions
+# -----------------------------
+
+# Function: usage
+# Description: Displays usage instructions.
+usage() {
+    echo "Usage: $0 [install|backup|restore] [options]"
+    echo ""
+    echo "Modes:"
+    echo "  install   Install BackupBash to /usr/local/bin for global access"
+    echo "  backup    Perform a backup"
+    echo "  restore   Restore from a backup"
+    echo ""
+    echo "Backup Options:"
+    echo "  -s  Source directory to back up"
+    echo "  -d  Destination directory for the backup"
+    echo "  -n  Backup file name"
+    echo "  -c  Compression method: none, gzip, bzip2, zip, tar"
+    echo "  -e  Encrypt the backup: yes or no"
+    echo "  -m  Encryption method: AES-256-CBC, ChaCha20 (required if encryption is yes)"
+    echo "  -k  Encryption key (required if encryption is yes)"
+    echo "  -i  Enable incremental backup: yes or no"
+    echo ""
+    echo "Restore Options:"
+    echo "  -f  Backup file to restore"
+    echo "  -r  Restore destination directory"
+    echo "  -k  Encryption key (required if backup is encrypted)"
+    echo ""
+    echo "Additional Options:"
+    echo "  -h  Display this help message"
+    echo ""
+    echo "If running in GUI mode without arguments, a mode selection dialog will appear."
+    exit 1
+}
+
+# Function: show_error
+# Description: Displays error messages using Zenity or echo.
+# Parameters:
+#   $1 - The error message to display.
+show_error() {
+    local message="$1"
+    if $USE_GUI; then
+        zenity --error --title="BackupBash Error" --text="$message" 2>/dev/null
+    else
+        echo "Error: $message" >&2
+    fi
+    # Log the error
+    if [ -n "$LOG_FILE" ]; then
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")] ERROR: $message" >> "$LOG_FILE"
+    fi
+    exit 1
+}
+
+# Function: show_info
+# Description: Displays information messages using Zenity or echo.
+# Parameters:
+#   $1 - The information message to display.
+show_info() {
+    local message="$1"
+    if $USE_GUI; then
+        zenity --info --title="BackupBash Information" --text="$message" 2>/dev/null
+    else
+        echo "Info: $message"
+    fi
+    # Log the information
+    if [ -n "$LOG_FILE" ]; then
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")] INFO: $message" >> "$LOG_FILE"
+    fi
+}
+
+# Function: install_zenity
+# Description: Installs Zenity using the appropriate package manager.
+install_zenity() {
+    echo "Attempting to install Zenity..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update && sudo apt-get install -y zenity
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y zenity
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -S --noconfirm zenity
+    elif command -v brew &> /dev/null; then
+        brew install zenity
+    else
+        show_error "Unsupported package manager. Please install Zenity manually."
+    fi
+    # Verify installation
+    if ! command -v zenity &> /dev/null; then
+        show_error "Failed to install Zenity. Please install it manually and rerun the script."
+    fi
+    echo "Zenity installed successfully."
+}
+
+# Function: open_directory
+# Description: Opens the specified directory in the default file manager.
+# Parameters:
+#   $1 - The directory to open.
+open_directory() {
+    local dir="$1"
+    if command -v xdg-open > /dev/null 2>&1; then
+        xdg-open "$dir" &
+    elif command -v open > /dev/null 2>&1; then
+        open "$dir" &
+    else
+        show_info "Cannot open the directory automatically. Please navigate to $dir manually."
+    fi
+}
+
+# Function: open_url
+# Description: Opens the specified URL in the default web browser.
+# Parameters:
+#   $1 - The URL to open.
+open_url() {
+    local url="$1"
+    if command -v xdg-open > /dev/null 2>&1; then
+        xdg-open "$url" &
+    elif command -v open > /dev/null 2>&1; then
+        open "$url" &
+    else
+        show_info "Cannot open the URL automatically. Please visit $url manually."
+    fi
+}
+
+# Function: setup_logging
+# Description: Initializes the logging system based on the mode.
+setup_logging() {
+    if [ "$MODE" == "backup" ]; then
+        LOG_FILE="$DEST_DIR/backup_$TIMESTAMP.log"
+    elif [ "$MODE" == "restore" ]; then
+        LOG_FILE="$RESTORE_DIR/restore_$TIMESTAMP.log"
+    fi
+    # Redirect all output to the log file
+    exec > >(tee -i "$LOG_FILE") 2>&1
+    echo "[$(date +"%Y-%m-%d %H:%M:%S")] Starting $MODE process..."
+}
+
+# Function: collect_inputs_gui_backup
+# Description: Collects backup inputs via GUI file selection dialogs and a sequence of forms.
+collect_inputs_gui_backup() {
+    # Step 1: Enter Backup Name
+    BACKUP_NAME=$(zenity --entry \
+        --title="BackupBash - Backup Name" \
+        --text="Enter a name for your backup file:\n- Use descriptive names for easy identification.\n- Avoid special characters." \
+        --entry-text "my_backup" 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$BACKUP_NAME" ]; then
+        show_error "Backup operation canceled or backup name not provided."
+    fi
+
+    # Step 2: Select Source Directory
+    SOURCE_DIR=$(zenity --file-selection --directory --title="BackupBash - Select Source Directory to Back Up" \
+        --text="Choose the directory you want to back up." 2>/dev/null)
+    if [ -z "$SOURCE_DIR" ]; then
+        show_error "No source directory selected."
+    fi
+
+    # Step 3: Select Destination Directory
+    DEST_DIR=$(zenity --file-selection --directory --title="BackupBash - Select Destination Directory for Backup" \
+        --text="Choose where to store your backup." 2>/dev/null)
+    if [ -z "$DEST_DIR" ]; then
+        show_error "No destination directory selected."
+    fi
+
+    # Step 4: Select Compression Method
+    COMPRESSION=$(zenity --list --radiolist --title="BackupBash - Select Compression Method" \
+        --text="Choose a compression method to reduce backup size:" \
+        --column="Select" --column="Compression Method" \
+        FALSE "none" \
+        FALSE "gzip" \
+        FALSE "bzip2" \
+        FALSE "zip" \
+        FALSE "tar" \
+        --height=300 --width=400 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$COMPRESSION" ]; then
+        show_error "Compression method not selected."
+    fi
+
+    # Step 5: Choose Whether to Encrypt Backup
+    ENCRYPT=$(zenity --list --radiolist --title="BackupBash - Encryption Option" \
+        --text="Do you want to encrypt your backup for added security?" \
+        --column="Select" --column="Encrypt Backup" \
+        FALSE "no" \
+        FALSE "yes" \
+        --height=200 --width=400 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$ENCRYPT" ]; then
+        show_error "Encryption option not selected."
+    fi
+
+    # Initialize encryption variables
+    ENCRYPT_METHOD=""
+    ENC_KEY=""
+
+    # If encryption is enabled, collect encryption method and key
+    if [ "$ENCRYPT" == "yes" ]; then
+        # Step 6: Select Encryption Method
+        ENCRYPT_METHOD=$(zenity --list --radiolist --title="BackupBash - Select Encryption Method" \
+            --text="Choose an encryption method to secure your backup:" \
+            --column="Select" --column="Encryption Method" \
+            FALSE "AES-256-CBC" \
+            FALSE "ChaCha20" \
+            --height=200 --width=400 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$ENCRYPT_METHOD" ]; then
+            show_error "Encryption method not selected."
+        fi
+
+        # Step 7: Enter Encryption Key
+        ENC_KEY=$(zenity --entry --title="BackupBash - Encryption Key" \
+            --text="Enter an encryption key:\n- Minimum 12 characters.\n- Include uppercase and lowercase letters.\n- Include numbers and special characters." \
+            --hide-text 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$ENC_KEY" ]; then
+            show_error "Encryption key not provided."
+        fi
+
+        # Validate Encryption Key Strength
+        if [ "${#ENC_KEY}" -lt 12 ]; then
+            show_error "Encryption key should be at least 12 characters long for better security."
+        fi
+
+        if ! [[ "$ENC_KEY" =~ [A-Z] && "$ENC_KEY" =~ [a-z] && "$ENC_KEY" =~ [0-9] && "$ENC_KEY" =~ [^A-Za-z0-9] ]]; then
+            show_error "Encryption key should contain uppercase, lowercase, numbers, and special characters."
+        fi
+    fi
+
+    # Step 8: Choose Whether to Enable Incremental Backup
+    INCREMENTAL=$(zenity --list --radiolist --title="BackupBash - Incremental Backup Option" \
+        --text="Do you want to enable incremental backups?\n- Only changes since the last backup will be saved." \
+        --column="Select" --column="Enable Incremental Backup" \
+        FALSE "no" \
+        FALSE "yes" \
+        --height=200 --width=400 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$INCREMENTAL" ]; then
+        show_error "Incremental backup option not selected."
+    fi
+
+    # Step 9: (Optional) Add Description for Backup
+    DESCRIPTION=$(zenity --entry \
+        --title="BackupBash - Backup Description" \
+        --text="Enter an optional description for your backup:\n- Helps in identifying backups later." \
+        --entry-text "" 2>/dev/null)
+    # DESCRIPTION can be empty; no need to check
+}
+
+# Function: collect_inputs_cli_backup
+# Description: Collects backup inputs via CLI arguments.
+collect_inputs_cli_backup() {
+    # Parse command-line options
+    while getopts ":s:d:n:c:e:m:k:i:" opt; do
+        case ${opt} in
+            s ) SOURCE_DIR=$OPTARG ;;
+            d ) DEST_DIR=$OPTARG ;;
+            n ) BACKUP_NAME=$OPTARG ;;
+            c ) COMPRESSION=$OPTARG ;;
+            e ) ENCRYPT=$OPTARG ;;
+            m ) ENCRYPT_METHOD=$OPTARG ;;
+            k ) ENC_KEY=$OPTARG ;;
+            i ) INCREMENTAL=$OPTARG ;;
+            \? ) usage ;;
+        esac
+    done
+
+    # Validate mandatory fields
+    if [ -z "${SOURCE_DIR:-}" ] || [ -z "${DEST_DIR:-}" ] || [ -z "${COMPRESSION:-}" ] || [ -z "${ENCRYPT:-}" ] || [ -z "${BACKUP_NAME:-}" ]; then
+        usage
+    fi
+
+    # Initialize encryption variables
+    ENCRYPT_METHOD=""
+    ENC_KEY=""
+
+    # If encryption is enabled, validate encryption method and key
+    if [ "$ENCRYPT" == "yes" ]; then
+        if [ -z "${ENCRYPT_METHOD:-}" ] || [ -z "${ENC_KEY:-}" ]; then
+            show_error "Encryption method and key are required when encryption is enabled."
+        fi
+
+        # Validate Encryption Key Strength
+        if [ "${#ENC_KEY}" -lt 12 ]; then
+            show_error "Encryption key should be at least 12 characters long for better security."
+        fi
+
+        if ! [[ "$ENC_KEY" =~ [A-Z] && "$ENC_KEY" =~ [a-z] && "$ENC_KEY" =~ [0-9] && "$ENC_KEY" =~ [^A-Za-z0-9] ]]; then
+            show_error "Encryption key should contain uppercase, lowercase, numbers, and special characters."
+        fi
+    fi
+
+    # Validate Compression Method
+    if ! [[ "$COMPRESSION" == "none" || "$COMPRESSION" == "gzip" || "$COMPRESSION" == "bzip2" || "$COMPRESSION" == "zip" || "$COMPRESSION" == "tar" ]]; then
+        show_error "Invalid compression option. Choose from none, gzip, bzip2, zip, tar."
+    fi
+
+    # Validate Encryption Option
+    if ! [[ "$ENCRYPT" == "yes" || "$ENCRYPT" == "no" ]]; then
+        show_error "Invalid encryption option. Choose from yes or no."
+    fi
+
+    # Validate Incremental Backup Option
+    if [ -n "${INCREMENTAL:-}" ] && ! [[ "$INCREMENTAL" == "yes" || "$INCREMENTAL" == "no" ]]; then
+        show_error "Invalid incremental backup option. Choose from yes or no."
+    fi
+}
+
+# Function: collect_inputs_gui_restore
+# Description: Collects restore inputs via GUI file selection dialogs and prompts.
+collect_inputs_gui_restore() {
+    # Step 1: Select Backup File to Restore
+    BACKUP_FILE=$(zenity --file-selection --title="BackupBash - Select Backup File to Restore" \
+        --text="Choose the backup file you wish to restore." 2>/dev/null)
+    if [ -z "$BACKUP_FILE" ]; then
+        show_error "No backup file selected."
+    fi
+
+    # Step 2: Select Restore Destination Directory
+    RESTORE_DIR=$(zenity --file-selection --directory --title="BackupBash - Select Restore Destination Directory" \
+        --text="Choose where to restore your backup." 2>/dev/null)
+    if [ -z "$RESTORE_DIR" ]; then
+        show_error "No restore destination selected."
+    fi
+
+    # Step 3: If the backup file is encrypted, prompt for encryption key
+    if [[ "$BACKUP_FILE" == *.enc ]]; then
+        ENC_KEY=$(zenity --entry --title="BackupBash - Encryption Key" \
+            --text="Enter Encryption Key:\n- At least 12 characters\n- Include uppercase and lowercase letters\n- Include numbers and special characters" \
+            --hide-text 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$ENC_KEY" ]; then
+            show_error "Encryption key is required to decrypt the backup."
+        fi
+
+        # Validate Encryption Key Strength
+        if [ "${#ENC_KEY}" -lt 12 ]; then
+            show_error "Encryption key should be at least 12 characters long for better security."
+        fi
+
+        if ! [[ "$ENC_KEY" =~ [A-Z] && "$ENC_KEY" =~ [a-z] && "$ENC_KEY" =~ [0-9] && "$ENC_KEY" =~ [^A-Za-z0-9] ]]; then
+            show_error "Encryption key should contain uppercase, lowercase, numbers, and special characters."
+        fi
+    fi
+}
+
+# Function: collect_inputs_cli_restore
+# Description: Collects restore inputs via CLI arguments.
+collect_inputs_cli_restore() {
+    # Parse command-line options
+    while getopts ":f:r:k:" opt; do
+        case ${opt} in
+            f ) BACKUP_FILE=$OPTARG ;;
+            r ) RESTORE_DIR=$OPTARG ;;
+            k ) ENC_KEY=$OPTARG ;;
+            \? ) usage ;;
+        esac
+    done
+
+    # Validate inputs
+    if [ -z "${BACKUP_FILE:-}" ] || [ -z "${RESTORE_DIR:-}" ]; then
+        usage
+    fi
+
+    # If backup file is encrypted, ensure encryption key is provided
+    if [[ "$BACKUP_FILE" == *.enc ]]; then
+        if [ -z "${ENC_KEY:-}" ]; then
+            show_error "Encryption key is required to decrypt the backup."
+        fi
+
+        # Validate Encryption Key Strength
+        if [ "${#ENC_KEY}" -lt 12 ]; then
+            show_error "Encryption key should be at least 12 characters long for better security."
+        fi
+
+        if ! [[ "$ENC_KEY" =~ [A-Z] && "$ENC_KEY" =~ [a-z] && "$ENC_KEY" =~ [0-9] && "$ENC_KEY" =~ [^A-Za-z0-9] ]]; then
+            show_error "Encryption key should contain uppercase, lowercase, numbers, and special characters."
+        fi
+    fi
+}
+
+# Function: perform_backup
+# Description: Executes the backup process.
+perform_backup() {
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    BACKUP_NAME_FULL="${BACKUP_NAME}_${TIMESTAMP}"
+
+    if $USE_GUI; then
+        # Initialize variables to capture the final backup file path
+        BACKUP_FINAL=""
+
+        # Create a temporary file to capture the backup result
+        TEMP_FILE=$(mktemp)
+
+        (
+            echo "0" ; sleep 0.1
+            echo "# Starting backup..."
+
+            # Handle Incremental Backup
+            if [ "$INCREMENTAL" == "yes" ]; then
+                LAST_BACKUP_FILE="$DEST_DIR/last_backup.timestamp"
+                if [ -f "$LAST_BACKUP_FILE" ]; then
+                    LAST_BACKUP=$(cat "$LAST_BACKUP_FILE")
+                else
+                    LAST_BACKUP=0
+                fi
+                MODIFIED_FILES=$(find "$SOURCE_DIR" -type f -newermt "@$LAST_BACKUP")
+                if [ -z "$MODIFIED_FILES" ]; then
+                    echo "100" ; echo "# No changes detected since the last backup."
+                    echo "NO_CHANGE" > "$TEMP_FILE"
+                    exit 0
+                fi
+                TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}_incremental.tar"
+                tar -cf "$TAR_FILE" $MODIFIED_FILES && echo "25" && echo "# Creating incremental backup..."
+            else
+                TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar"
+            fi
+
+            # Handle Compression
+            case $COMPRESSION in
+                none)
+                    tar -cf "$TAR_FILE" "$SOURCE_DIR" && echo "50" && echo "# Archiving files without compression..."
+                    ;;
+                gzip)
+                    TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar.gz"
+                    tar -czf "$TAR_FILE" "$SOURCE_DIR" && echo "50" && echo "# Archiving and compressing with gzip..."
+                    ;;
+                bzip2)
+                    TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar.bz2"
+                    tar -cjf "$TAR_FILE" "$SOURCE_DIR" && echo "50" && echo "# Archiving and compressing with bzip2..."
+                    ;;
+                zip)
+                    TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.zip"
+                    zip -r "$TAR_FILE" "$SOURCE_DIR" && echo "50" && echo "# Archiving and compressing with zip..."
+                    ;;
+                tar)
+                    TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar"
+                    tar -cf "$TAR_FILE" "$SOURCE_DIR" && echo "50" && echo "# Archiving with tar..."
+                    ;;
+                *)
+                    show_error "Invalid compression option selected."
+                    ;;
+            esac
+
+            # Handle Encryption
+            if [ "$ENCRYPT" == "yes" ]; then
+                case $ENCRYPT_METHOD in
+                    "AES-256-CBC")
+                        openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$TAR_FILE" -out "${TAR_FILE}.enc" -k "$ENC_KEY" && rm "$TAR_FILE"
+                        BACKUP_FINAL="${TAR_FILE}.enc"
+                        echo "75" && echo "# Encrypting backup with AES-256-CBC..."
+                        ;;
+                    "ChaCha20")
+                        openssl enc -chacha20 -salt -pbkdf2 -iter 100000 -in "$TAR_FILE" -out "${TAR_FILE}.enc" -k "$ENC_KEY" && rm "$TAR_FILE"
+                        BACKUP_FINAL="${TAR_FILE}.enc"
+                        echo "75" && echo "# Encrypting backup with ChaCha20..."
+                        ;;
+                    *)
+                        show_error "Invalid encryption method selected."
+                        ;;
+                esac
+            else
+                BACKUP_FINAL="$TAR_FILE"
+            fi
+
+            # Update Last Backup Timestamp for Incremental Backups
+            if [ "$INCREMENTAL" == "yes" ]; then
+                date +%s > "$DEST_DIR/last_backup.timestamp"
+                echo "80" && echo "# Updated last backup timestamp."
+            fi
+
+            # Final Confirmation
+            if [ -f "$BACKUP_FINAL" ]; then
+                echo "100" ; echo "# Backup completed successfully."
+                echo "$BACKUP_FINAL" > "$TEMP_FILE"
+            else
+                echo "100" ; echo "# Backup failed."
+                echo "FAILED" > "$TEMP_FILE"
+                exit 1
+            fi
+        ) | zenity --progress --title="BackupBash Backup Progress" --text="Initializing backup..." --percentage=0 --auto-close --auto-kill
+
+        # Capture the final backup file path from the temporary file
+        if [ -f "$TEMP_FILE" ]; then
+            BACKUP_FINAL=$(cat "$TEMP_FILE")
+            rm "$TEMP_FILE"
+        fi
+
+        # Check the result
+        if [ "$BACKUP_FINAL" == "NO_CHANGE" ]; then
+            show_info "No changes detected since the last backup. Backup not created."
+            exit 0
+        elif [ "$BACKUP_FINAL" == "FAILED" ] || [ -z "$BACKUP_FINAL" ]; then
+            show_error "Backup failed. Please check your settings and try again."
+        else
+            show_info "Backup successful:\n$BACKUP_FINAL"
+            # Open the destination directory
+            open_directory "$DEST_DIR"
+            # Thank-you dialog with GitHub link
+            zenity --question --title="Thank You" --text="Thank you for using BackupBash!\n\nFor more scripts and updates, visit my GitHub repository?" 
+            if [ $? -eq 0 ]; then
+                open_url "$GITHUB_URL"
+            fi
+        fi
+    else
+        BACKUP_NAME_FULL="${BACKUP_NAME}_${TIMESTAMP}"
+
+        # Handle Incremental Backup
+        if [ "$INCREMENTAL" == "yes" ]; then
+            LAST_BACKUP_FILE="$DEST_DIR/last_backup.timestamp"
+            if [ -f "$LAST_BACKUP_FILE" ]; then
+                LAST_BACKUP=$(cat "$LAST_BACKUP_FILE")
+            else
+                LAST_BACKUP=0
+            fi
+            MODIFIED_FILES=$(find "$SOURCE_DIR" -type f -newermt "@$LAST_BACKUP")
+            if [ -z "$MODIFIED_FILES" ]; then
+                echo "No changes detected since the last backup."
+                exit 0
+            fi
+            TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}_incremental.tar"
+            tar -cf "$TAR_FILE" $MODIFIED_FILES
+            echo "Created incremental backup: $TAR_FILE"
+        else
+            TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar"
+        fi
+
+        # Handle Compression
+        case $COMPRESSION in
+            none)
+                tar -cf "$TAR_FILE" "$SOURCE_DIR"
+                echo "Archived files without compression."
+                ;;
+            gzip)
+                TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar.gz"
+                tar -czf "$TAR_FILE" "$SOURCE_DIR"
+                echo "Archived and compressed with gzip."
+                ;;
+            bzip2)
+                TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar.bz2"
+                tar -cjf "$TAR_FILE" "$SOURCE_DIR"
+                echo "Archived and compressed with bzip2."
+                ;;
+            zip)
+                TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.zip"
+                zip -r "$TAR_FILE" "$SOURCE_DIR"
+                echo "Archived and compressed with zip."
+                ;;
+            tar)
+                TAR_FILE="$DEST_DIR/${BACKUP_NAME_FULL}.tar"
+                tar -cf "$TAR_FILE" "$SOURCE_DIR"
+                echo "Archived with tar."
+                ;;
+            *)
+                show_error "Invalid compression option."
+                ;;
+        esac
+
+        # Handle Encryption
+        if [ "$ENCRYPT" == "yes" ]; then
+            case $ENCRYPT_METHOD in
+                "AES-256-CBC")
+                    openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$TAR_FILE" -out "${TAR_FILE}.enc" -k "$ENC_KEY"
+                    ;;
+                "ChaCha20")
+                    openssl enc -chacha20 -salt -pbkdf2 -iter 100000 -in "$TAR_FILE" -out "${TAR_FILE}.enc" -k "$ENC_KEY"
+                    ;;
+                *)
+                    show_error "Invalid encryption method."
+                    ;;
+            esac
+            rm "$TAR_FILE"
+            BACKUP_FINAL="$TAR_FILE.enc"
+            echo "Backup encrypted successfully: $BACKUP_FINAL"
+        else
+            BACKUP_FINAL="$TAR_FILE"
+        fi
+
+        # Update Last Backup Timestamp for Incremental Backups
+        if [ "$INCREMENTAL" == "yes" ]; then
+            date +%s > "$DEST_DIR/last_backup.timestamp"
+            echo "Updated last backup timestamp."
+        fi
+
+        # Final Confirmation
+        if [ -f "$BACKUP_FINAL" ]; then
+            show_info "Backup successful: $BACKUP_FINAL"
+            # Open the destination directory
+            open_directory "$DEST_DIR"
+            # Thank-you message
+            echo "Thank you for using BackupBash!"
+            echo "For more scripts and updates, visit my GitHub repository: $GITHUB_URL"
+        else
+            show_error "Backup failed."
+        fi
+    fi
+}
+
+# Function: perform_restore
+# Description: Executes the restore process.
+perform_restore() {
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    if $USE_GUI; then
+        if [[ "$BACKUP_FILE" == *.enc ]]; then
+            DECRYPTED_FILE="${BACKUP_FILE%.enc}"
+            openssl enc -aes-256-cbc -d -salt -pbkdf2 -iter 100000 -in "$BACKUP_FILE" -out "$DECRYPTED_FILE" -k "$ENC_KEY" || show_error "Decryption failed."
+            echo "Decrypted backup file: $DECRYPTED_FILE"
+        else
+            DECRYPTED_FILE="$BACKUP_FILE"
+        fi
+
+        # Handle Extraction Based on File Type
+        case $DECRYPTED_FILE in
+            *.tar )
+                tar -xf "$DECRYPTED_FILE" -C "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *.tar.gz )
+                tar -xzf "$DECRYPTED_FILE" -C "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *.tar.bz2 )
+                tar -xjf "$DECRYPTED_FILE" -C "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *.zip )
+                unzip "$DECRYPTED_FILE" -d "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *)
+                show_error "Unsupported archive format: $DECRYPTED_FILE"
+                ;;
+        esac
+
+        show_info "Restore completed successfully to $RESTORE_DIR"
+    else
+        if [[ "$BACKUP_FILE" == *.enc ]]; then
+            DECRYPTED_FILE="${BACKUP_FILE%.enc}"
+            openssl enc -aes-256-cbc -d -salt -pbkdf2 -iter 100000 -in "$BACKUP_FILE" -out "$DECRYPTED_FILE" -k "$ENC_KEY" || show_error "Decryption failed."
+            echo "Decrypted backup file: $DECRYPTED_FILE"
+        else
+            DECRYPTED_FILE="$BACKUP_FILE"
+        fi
+
+        # Handle Extraction Based on File Type
+        case $DECRYPTED_FILE in
+            *.tar )
+                tar -xf "$DECRYPTED_FILE" -C "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *.tar.gz )
+                tar -xzf "$DECRYPTED_FILE" -C "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *.tar.bz2 )
+                tar -xjf "$DECRYPTED_FILE" -C "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *.zip )
+                unzip "$DECRYPTED_FILE" -d "$RESTORE_DIR" || show_error "Restore failed."
+                ;;
+            *)
+                show_error "Unsupported archive format: $DECRYPTED_FILE"
+                ;;
+        esac
+
+        show_info "Restore completed successfully to $RESTORE_DIR"
+    fi
+}
+
+# Function: setup_cron
+# Description: Sets up a cron job for automated backups.
+setup_cron() {
+    local script_path
+    script_path="$(realpath "$0")"
+    if $USE_GUI; then
+        FREQUENCY=$(zenity --list --radiolist --title="BackupBash - Select Backup Frequency" \
+            --text="Choose how often you want backups to run automatically:" \
+            --column="Select" --column="Frequency" \
+            FALSE "Daily" \
+            FALSE "Weekly" \
+            FALSE "Monthly" \
+            --height=250 --width=400 2>/dev/null)
+        if [ -z "$FREQUENCY" ]; then
+            show_error "No frequency selected."
+        fi
+    else
+        echo "Select Backup Frequency:"
+        echo "1) Daily"
+        echo "2) Weekly"
+        echo "3) Monthly"
+        read -rp "Enter choice [1-3]: " freq_choice
+        case $freq_choice in
+            1 ) FREQUENCY="Daily" ;;
+            2 ) FREQUENCY="Weekly" ;;
+            3 ) FREQUENCY="Monthly" ;;
+            * ) show_error "Invalid frequency choice." ;;
+        esac
+    fi
+
+    case $FREQUENCY in
+        Daily)
+            CRON_SCHEDULE="0 2 * * *"
+            ;;
+        Weekly)
+            CRON_SCHEDULE="0 2 * * 0"
+            ;;
+        Monthly)
+            CRON_SCHEDULE="0 2 1 * *"
+            ;;
+        *)
+            show_error "Invalid frequency selected."
+            ;;
+    esac
+
+    (
+        crontab -l 2>/dev/null
+        echo "$CRON_SCHEDULE $script_path backup -s \"$SOURCE_DIR\" -d \"$DEST_DIR\" -n \"$BACKUP_NAME\" -c \"$COMPRESSION\" -e \"$ENCRYPT\" -m \"$ENCRYPT_METHOD\" -k \"$ENC_KEY\" -i \"$INCREMENTAL\""
+    ) | crontab -
+
+    if $USE_GUI; then
+        show_info "Cron job scheduled successfully for $FREQUENCY backups."
+    else
+        echo "Cron job scheduled successfully for $FREQUENCY backups."
+    fi
+}
+
+# Function: install_script
+# Description: Installs the script to /usr/local/bin as BackupBash for global access.
+install_script() {
+    local script_path
+    script_path="$(realpath "$0")"
+    if [ "$(dirname "$script_path")" == "/usr/local/bin" ]; then
+        echo "BackupBash is already installed in /usr/local/bin."
+        exit 0
+    fi
+    sudo cp "$script_path" /usr/local/bin/BackupBash
+    sudo chmod +x /usr/local/bin/BackupBash
+    if [ "$(which BackupBash)" == "/usr/local/bin/BackupBash" ]; then
+        echo "BackupBash has been successfully installed to /usr/local/bin."
+        echo "You can now run it from anywhere using the command: BackupBash"
+    else
+        show_error "Failed to install BackupBash to /usr/local/bin."
+    fi
+}
+
+# Function: perform_backup_or_restore
+# Description: Decides whether to perform backup or restore based on mode.
+perform_backup_or_restore() {
+    if [ "$MODE" == "backup" ]; then
+        perform_backup
+        if $USE_GUI; then
+            zenity --question --title="BackupBash - Schedule Backup" --text="Do you want to schedule regular backups?"
+            if [ $? -eq 0 ]; then
+                setup_cron
+            fi
+        else
+            read -rp "Do you want to schedule regular backups? (y/n): " schedule_choice
+            if [[ "$schedule_choice" == "y" || "$schedule_choice" == "Y" ]]; then
+                setup_cron
+            fi
+        fi
+    elif [ "$MODE" == "restore" ]; then
+        perform_restore
+    else
+        usage
+    fi
+}
+
+# -----------------------------
+# Main Script Execution
+# -----------------------------
+
+# Function: initialize
+# Description: Initializes the script by setting up GUI support and parsing arguments.
+initialize() {
+    OS_TYPE=$(uname)
+    if [ -n "${DISPLAY:-}" ]; then
+        if command -v zenity &> /dev/null; then
+            USE_GUI=true
+        else
+            USE_GUI=true
+            install_zenity
+        fi
+    else
+        USE_GUI=false
+    fi
+
+    if [ $# -eq 0 ]; then
+        if $USE_GUI; then
+            MODE=$(zenity --list --radiolist --title="BackupBash - Select Mode" \
+                --text="Choose the operation mode:" \
+                --column="Select" --column="Mode" \
+                FALSE "Backup" \
+                FALSE "Restore" \
+                --height=250 --width=400 2>/dev/null)
+
+            if [ -z "$MODE" ]; then
+                show_error "No mode selected."
+            fi
+
+            MODE=$(echo "$MODE" | tr '[:upper:]' '[:lower:]')
+
+            # Collect inputs now before setup_logging
+            if [ "$MODE" == "backup" ]; then
+                collect_inputs_gui_backup
+            elif [ "$MODE" == "restore" ]; then
+                collect_inputs_gui_restore
+            else
+                usage
+            fi
+        else
+            echo "No mode specified."
+            usage
+        fi
+    else
+        MODE="${1:-}"
+        shift || true
+        if [ "$MODE" == "install" ]; then
+            install_script
+            exit 0
+        elif [ "$MODE" == "backup" ]; then
+            if $USE_GUI; then
+                collect_inputs_gui_backup
+            else
+                collect_inputs_cli_backup
+            fi
+        elif [ "$MODE" == "restore" ]; then
+            if $USE_GUI; then
+                collect_inputs_gui_restore
+            else
+                collect_inputs_cli_restore
+            fi
+        else
+            usage
+        fi
+    fi
+
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    setup_logging
+}
+
+# Initialize the script
+initialize "$@"
+
+# Validate directory existence
+if [ "$MODE" == "backup" ]; then
+    if [ ! -d "$SOURCE_DIR" ]; then
+        show_error "Source directory does not exist: $SOURCE_DIR"
+    fi
+    if [ ! -d "$DEST_DIR" ]; then
+        show_error "Destination directory does not exist: $DEST_DIR"
+    fi
+elif [ "$MODE" == "restore" ]; then
+    if [ ! -f "$BACKUP_FILE" ]; then
+        show_error "Backup file does not exist: $BACKUP_FILE"
+    fi
+    if [ ! -d "$RESTORE_DIR" ]; then
+        show_error "Restore destination directory does not exist: $RESTORE_DIR"
+    fi
+fi
+
+# Perform Backup or Restore
+perform_backup_or_restore
