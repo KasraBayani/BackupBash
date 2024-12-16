@@ -1,0 +1,73 @@
+name: BackupBash Tests
+
+on:
+  push:
+    branches: [ main ] # Run tests on pushes to the main branch
+  pull_request:
+    branches: [ main ] # Run tests on pull requests to the main branch
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up test environment
+      run: |
+        mkdir -p test_source test_destination test_restore
+        echo "This is a test file" > test_source/file1.txt
+        echo "Another test file" > test_source/file2.txt
+        mkdir test_source/subdir
+        echo "File in subdir" > test_source/subdir/file3.txt
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y openssl zip tar
+
+    - name: Run BackupBash install
+      run: bash BackupBash install
+
+    - name: Run basic backup test (no compression, no encryption)
+      run: BackupBash backup -s test_source -d test_destination -n test_backup -c none -e no
+
+    - name: Verify backup file exists
+      run: |
+        if [ ! -f test_destination/test_backup_*.tar ]; then
+          echo "Backup file not found!"
+          exit 1
+        fi
+
+    - name: Run restore test
+      run: BackupBash restore -f test_destination/test_backup_*.tar -r test_restore
+
+    - name: Verify restored files
+      run: |
+        if [ ! -f test_restore/file1.txt ]; then
+          echo "Restored file1.txt not found!"
+          exit 1
+        fi
+        if [ ! -f test_restore/subdir/file3.txt ]; then
+          echo "Restored subdir/file3.txt not found!"
+          exit 1
+        fi
+
+    - name: Run backup test (gzip compression, AES encryption)
+      run: BackupBash backup -s test_source -d test_destination -n test_backup_enc -c gzip -e yes -m AES-256-CBC -k "TestKey12345!"
+
+    - name: Verify encrypted backup file exists
+      run: |
+        if [ ! -f test_destination/test_backup_enc_*.tar.gz.enc ]; then
+          echo "Encrypted backup file not found!"
+          exit 1
+        fi
+
+    - name: Run restore test (encrypted)
+      run: BackupBash restore -f test_destination/test_backup_enc_*.tar.gz.enc -r test_restore -k "TestKey12345!"
+
+    - name: Verify restored files (encrypted)
+      run: |
+        if [ ! -f test_restore/file2.txt ]; then
+          echo "Restored file2.txt (encrypted) not found!"
+          exit 1
+        fi
