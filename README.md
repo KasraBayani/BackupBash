@@ -1,3 +1,5 @@
+This version is untested on new Linux versions. Try at your own risk!
+
 # BackupBash
 
 BackupBash is a versatile backup and restore Bash script that supports both graphical (Zenity) and command-line interfaces. It offers features like compression, encryption, incremental backups, logging, and scheduling via cron.
